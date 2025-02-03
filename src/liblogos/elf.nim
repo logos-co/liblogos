@@ -1,4 +1,4 @@
-import os, posix, memfiles, std/sequtils, std/strformat
+import os, posix, memfiles, std/sequtils, std/strformat, strutils
 
 proc `+`*(a: pointer, s: Natural): pointer = cast[pointer](cast[int](a) + s)
 
@@ -147,6 +147,56 @@ type
   #   info*: uint32          # Miscellaneous information
   #   addralign*: uint64     # Address alignment boundary
   #   entsize*: uint64       # Size of entries, if section has table
+
+  SymbolBinding* = enum
+    STB_LOCAL = 0'u32        # Local symbol
+    STB_GLOBAL = 1'u32       # Global symbol
+    STB_WEAK = 2'u32         # Weak symbol
+    STB_LOOS = 10'u32        # Start of OS-specific
+    STB_HIOS = 12'u32        # End of OS-specific
+    STB_LOPROC = 13'u32      # Start of processor-specific
+    STB_HIPROC = 15'u32      # End of processor-specific
+
+  SymbolType* = enum
+    STT_NOTYPE = 0'u32       # Symbol type is unspecified
+    STT_OBJECT = 1'u32       # Symbol is a data object
+    STT_FUNC = 2'u32         # Symbol is a code object
+    STT_SECTION = 3'u32      # Symbol associated with a section
+    STT_FILE = 4'u32         # Symbol's name is file name
+    STT_COMMON = 5'u32       # Symbol is a common data object
+    STT_TLS = 6'u32          # Symbol is thread-local data object
+    STT_RELC = 8'u32         # Complex relocation expression
+    STT_SRELC = 9'u32        # Signed Complex relocation expression
+    STT_GNU_IFUNC = 10'u32   # GNU indirect function
+    STT_HIOS = 12'u32        # End of OS-specific
+    STT_LOPROC = 13'u32      # Start of processor-specific
+    STT_HIPROC = 15'u32      # End of processor-specific
+
+  RelocationType_x86_64* = enum
+    R_X86_64_NONE = 0'u32            # No reloc
+    R_X86_64_64 = 1'u32             # Direct 64 bit
+    R_X86_64_PC32 = 2'u32           # PC relative 32 bit signed
+    R_X86_64_GOT32 = 3'u32          # 32 bit GOT entry
+    R_X86_64_PLT32 = 4'u32          # 32 bit PLT address
+    R_X86_64_COPY = 5'u32           # Copy symbol at runtime
+    R_X86_64_GLOB_DAT = 6'u32       # Create GOT entry
+    R_X86_64_JUMP_SLOT = 7'u32      # Create PLT entry
+    R_X86_64_RELATIVE = 8'u32       # Adjust by program base
+    R_X86_64_GOTPCREL = 9'u32       # 32 bit signed PC relative offset to GOT
+    R_X86_64_32 = 10'u32            # Direct 32 bit zero extended
+    R_X86_64_32S = 11'u32           # Direct 32 bit sign extended
+    R_X86_64_16 = 12'u32            # Direct 16 bit zero extended
+    R_X86_64_PC16 = 13'u32          # 16 bit sign extended pc relative
+    R_X86_64_8 = 14'u32             # Direct 8 bit sign extended
+    R_X86_64_PC8 = 15'u32           # 8 bit sign extended pc relative
+    R_X86_64_DTPMOD64 = 16'u32      # ID of module containing symbol
+    R_X86_64_DTPOFF64 = 17'u32      # Offset in TLS block
+    R_X86_64_TPOFF64 = 18'u32       # Offset in initial TLS block
+    R_X86_64_TLSGD = 19'u32         # 32 bit signed PC relative offset to TLS
+    R_X86_64_TLSLD = 20'u32         # 32 bit signed PC relative offset to TLS
+    R_X86_64_DTPOFF32 = 21'u32      # Offset in TLS block
+    R_X86_64_GOTTPOFF = 22'u32      # 32 bit signed PC relative offset to GOT
+    R_X86_64_TPOFF32 = 23'u32       # Offset in initial TLS block
 
 let pageSize = sysconf(SC_PAGESIZE)
 
@@ -305,8 +355,8 @@ proc loadElf*(ctx: var ElfContext, path:string): bool =
   # # echo $sectionHeaders
 
   # TODO Relocations
-  var rela = 0'u64
-  var relasz = 0'u64
+  var relaAddr: uint64 = 0
+  var relaSize: uint64 = 0
   let dynamicSegments = programHeaders.filter(proc(ph: ElfProgramHeader64): bool = ph.prgtype == PT_DYNAMIC)
   if dynamicSegments.len > 0:
     let dynamicSegment = dynamicSegments[0]
@@ -314,68 +364,38 @@ proc loadElf*(ctx: var ElfContext, path:string): bool =
     let maxEntries = int(dynamicSegment.filesz) div sizeof(DynamicEntry64)
     for i in 0..<maxEntries:
         let entry = dynStart[i]
-        if entry.tag == DT_NULL:
-            break
-        elif entry.tag == DT_RELA:
-          rela = entry.value
-        elif entry.tag == DT_RELASZ:
-          relasz = entry.value
-  
-  echo "rela: ", rela, " relasz: ", relasz
-  if rela > 0 and relasz > 0:
-    let numRela = int(relasz) div sizeof(RelaEntry64)
-    let relaStart = cast[ptr UncheckedArray[RelaEntry64]](ctx.map_addr + rela.int)
+        case entry.tag
+        of DT_RELA: relaAddr = entry.value
+        of DT_RELASZ: relaSize = entry.value
+        of DT_NULL: break
+        else: discard
+
+  echo "relaAddr: ", relaAddr, " relaSize: ", relaSize
+  if relaAddr > 0 and relaSize > 0:
+    let numRela = int(relaSize) div sizeof(RelaEntry64)
+    let relaStart = cast[ptr UncheckedArray[RelaEntry64]](ctx.map_addr + relaAddr)
     echo "numRela: ", numRela
     
-    for i in 0..<numRela.int:
+    for i in 0..<numRela:
       let entry = relaStart[i]
-      # r_offset: where to apply the relocation
-      # r_info: contains both symbol index and relocation type
-      # r_addend: constant addend used to compute value
+      # offset: where to apply the relocation
+      # info: contains both symbol index and relocation type
+      # addend: constant addend used to compute value
       
-      let r_sym = entry.info shr 32  # Top 32 bits are symbol index
-      let r_type = entry.info and 0xffffffff'u64  # Bottom 32 bits are relocation type
+      let symbolIndex = uint32(entry.info shr 32)        # Top 32 bits are symbol index
+      let relocationType = uint32(entry.info and 0xffffffff'u64)  # Bottom 32 bits are relocation type
       
       echo "Relocation at offset: ", entry.offset
-      echo "  Symbol index: ", r_sym
-      echo "  Type: ", r_type 
+      echo "  Symbol index: ", symbolIndex
+      echo "  Type: ", relocationType 
       echo "  Addend: ", entry.addend
 
-      # TODO: Apply the relocation based on type
-      # Common x64 relocation types:
-      # R_X86_64_64 (1): S + A
-      # R_X86_64_RELATIVE (8): B + A
-      # R_X86_64_GLOB_DAT (6): S
-      # R_X86_64_JUMP_SLOT (7): S
-      
-      # case r_type:
-      # of 8: # R_X86_64_RELATIVE
-      #   # Simplest case - just base + addend
-      #   let target = cast[ptr uint64](baseAddr + entry.offset.int)
-      #   target[] = cast[uint64](baseAddr) + entry.r_addend
-      # else:
-      #   echo "Unhandled relocation type: ", r_type
-
-    
-
-
-  # echo $entries
-
-  # var relaAddr: uint64 = 0
-  # var relaSize: uint64 = 0
-
-  # for entry in dynamicEntries:
-  #   case entry.tag
-  #   of DT_RELA: relaAddr = entry.value
-  #   of DT_RELASZ: relaSize = entry.value
-  #   else: discard
-
-  # if relaAddr != 0 and relaSize != 0:
-  #   let numRela = relaSize div sizeof(RelaEntry64).uint64
-  #   let relaStart = cast[ptr RelaEntry64](ctx.map_addr + relaAddr.int)
-  #   for i in 0..<numRela.int:
-  #     let rela = relaStart[i]
-  #     echo "Relocation at: ", rela.offset
+    #   # TODO: Apply the relocation based on type?
+    #   # Common x64 relocation types:
+    #   # R_X86_64_64 (1): S + A
+    #   # R_X86_64_RELATIVE (8): B + A
+    #   # R_X86_64_GLOB_DAT (6): S
+    #   # R_X86_64_JUMP_SLOT (7): S
 
 
 
