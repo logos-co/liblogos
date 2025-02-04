@@ -1,6 +1,5 @@
 import unittest
-import liblogos/elf
+import liblogos
 
 test "load ELF":
-  var ctx: ElfContext
-  check loadElf(ctx, "/bin/ls")
+  check liblogos.load("/bin/ls")
