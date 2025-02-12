@@ -1,4 +1,4 @@
-import os, posix
+import os, posix, posix/linux
 import std/[sequtils, strformat, strutils, options] 
 
 proc `+`*(a: pointer, s: Natural): pointer = cast[pointer](cast[int](a) + s)
@@ -185,8 +185,28 @@ type
     R_X86_64_TPOFF32 = 23'u32       # Offset in initial TLS block: uint32 = S + A - TP
 
 const
+  # mman.h
   MAP_GROWSDOWN = 0x00100    # Stack-like segment.
   MAP_STACK = 0x20000        # Allocation is for a stack.
+  # elf.h
+  AT_NULL* = 0        # End of vector
+  AT_PHDR* = 3        # Program headers for program
+  AT_PHENT* = 4       # Size of program header entry
+  AT_PHNUM* = 5       # Number of program headers
+  AT_PAGESZ* = 6      # System page size
+  AT_BASE* = 7        # Base address of interpreter
+  AT_FLAGS* = 8       # Flags
+  AT_ENTRY* = 9       # Entry point of program
+  AT_UID* = 11        # Real uid
+  AT_EUID* = 12       # Effective uid
+  AT_GID* = 13        # Real gid
+  AT_EGID* = 14       # Effective gid
+  AT_PLATFORM* = 15   # String identifying platform
+  AT_HWCAP* = 16      # Machine-dependent hints about processor capabilities
+  AT_CLKTCK* = 17     # Frequency of times()
+  AT_SECURE* = 23     # Boolean, was exec setuid-like?
+  AT_RANDOM* = 25     # Address of 16 random bytes
+  AT_EXECFN* = 31     # Filename of executable
 
 let pageSize = sysconf(SC_PAGESIZE)
 
@@ -201,6 +221,8 @@ proc c_execve(pathname: cstring, argv: ptr cstring, envp: ptr cstring): cint {.
 
 proc c_memfdCreate(name: cstring, flags: cint): cint {.header: "<sys/mman.h>",
         importc: "memfd_create".}
+
+proc getAuxVal(id: culong): culong {.importc: "getauxval", header: "<sys/auxv.h>".}
 
 proc isElf(buffer: seq[byte]): bool =
   let map_addr = cast[pointer](buffer[0].unsafeAddr)
@@ -414,7 +436,59 @@ proc mapElf(
 
   result = (basePtr, header, optInterp)
 
-proc setupStack*(
+
+
+proc pushBytes(data: var seq[byte], bytes: openArray[byte], stackEndAddr: uint): uint =
+  result = stackEndAddr - data.len.uint
+  for b in bytes:
+    data.add(b)
+
+proc pushString(data: var seq[byte], s: cstring, stackEndAddr: uint): uint =
+  # Include null terminator
+  var bytes = newSeq[byte](s.len + 1)
+  copyMem(bytes[0].addr, s[0].unsafeAddr, s.len)
+  bytes[^1] = 0
+  result = pushBytes(data, bytes, stackEndAddr)
+
+proc pushUint(data: var seq[byte], u: uint) =
+  var bytes: array[sizeof(uint), byte]
+  copyMem(bytes[0].addr, u.unsafeAddr, sizeof(uint))
+  discard pushBytes(data, bytes, 0'u) # stackEndAddr not needed for fixed-size pushes
+
+proc pushAuxv(
+  data: var seq[byte], 
+  pathAddr, platformAddr, randomAddr: uint,
+  binAddr: uint,
+  header: ElfHeader64,
+  interpAddr: Option[uint]
+) =
+  
+  let auxv = [
+    (AT_NULL, 0'u),
+    (AT_PLATFORM, platformAddr),
+    (AT_EXECFN, pathAddr),
+    (AT_SECURE, getAuxVal(AT_SECURE)),
+    (AT_RANDOM, randomAddr),
+    (AT_CLKTCK, sysconf(SC_CLK_TCK)),
+    (AT_HWCAP, getAuxVal(AT_HWCAP)),
+    (AT_EGID, uint(getegid())),
+    (AT_GID, uint(getgid())),
+    (AT_EUID, uint(geteuid())),
+    (AT_UID, uint(getuid())),
+    (AT_ENTRY, binAddr + header.entry),
+    (AT_FLAGS, 0'u),
+    (AT_BASE, interpAddr.get(0'u)),
+    (AT_PAGESZ, pageSize),
+    (AT_PHNUM, header.phnum),
+    (AT_PHENT, header.phentsize),
+    (AT_PHDR, binAddr + header.phoff)
+  ]
+  
+  for (typ, val) in auxv:
+    pushUint(data, val)
+    pushUint(data, uint(typ))
+
+proc buildStack*(
   interpAddr: pointer,
   baseAddr: pointer, 
   header: ElfHeader64,
@@ -435,6 +509,57 @@ proc setupStack*(
     raiseOSError(osLastError())
 
   let stackEnd = stack + stackSize
+  var data = newSeqOfCap[byte](8192) # Pre-allocate reasonable size
+  let pathAddr = pushString(data, argv[0], stackEnd)
+  
+  # Environment variables
+  var envAddrs = newSeq[uint]()
+  for i in 0..high(env):
+    envAddrs.add(pushString(data, env[i], stackEnd))
+  
+  # Arguments
+  var argAddrs = newSeq[uint]()
+  for i in 0..high(argv):
+    argAddrs.add(pushString(data, argv[i], stackEnd))
+    
+  # Get platform and random data
+  let platform = cast[cstring](getAuxVal(AT_PLATFORM))
+  let platformAddr = pushString(data, platform, stackEnd)
+  
+  var random = newSeq[byte](16)
+  let randomPtr = cast[ptr UncheckedArray[byte]](getAuxVal(AT_RANDOM))
+  copyMem(random[0].addr, randomPtr, 16)
+  let randomAddr = pushBytes(data, random, stackEnd)
+  
+  # Align for argc
+  while (data.len + (argAddrs.len + envAddrs.len + 3) * sizeof(uint)) mod 16 != 0:
+    data.add(0)
+    
+  # Push auxiliary vector
+  pushAuxv(data, pathAddr, platformAddr, randomAddr, cast[uint](baseAddr), header, some(cast[uint](interpAddr)))
+  
+  # Environment array
+  data.add(0) # NULL terminator
+  for addr in envAddrs:
+    data.add(cast[byte](addr))
+    
+  # Argument array  
+  data.add(0) # NULL terminator
+  for addr in argAddrs:
+    data.add(cast[byte](addr))
+    
+  # Argc
+  let argc = cast[uint](argv.len)
+  data.add(cast[byte](argc))
+
+  # Now reverse the entire data sequence
+  data.reverse()
+  
+  # Calculate final stack pointer
+  let sp = stackEnd - data.len.uint
+  
+  # Copy the reversed data to the stack
+  copyMem(cast[pointer](sp), data[0].addr, data.len)
 
 
 proc ulExecve*(buffer: seq[byte], argv: cstringArray, env: cstringArray): bool =
@@ -443,7 +568,7 @@ proc ulExecve*(buffer: seq[byte], argv: cstringArray, env: cstringArray): bool =
   let (baseAddr, header, optInterp) = mapElf(buffer)
   let (interpLoadAddr, _) = optInterp.get
 
-  let sp = setupStack(
+  let stackPointer = buildStack(
     interpLoadAddr,
     baseAddr,
     header,

@@ -1,5 +1,5 @@
 import os, std/paths
-import liblogos/[elf, pe, macho]
+import liblogos/loader/[elf, pe, macho]
 
 when defined(macosx):
   proc NSGetEnviron(): ptr cstringArray {.importc: "_NSGetEnviron", header: "<crt_externs.h>".}

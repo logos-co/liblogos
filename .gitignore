@@ -1,7 +1,3 @@
 .nimble/
 .direnv/
-src/*
-!src/*.nim
-tests/*
-!tests/*.nim
-reference/
+core
